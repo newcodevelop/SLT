@@ -21,43 +21,9 @@ Original file is located at
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 
-os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"]="3"
-
-#!pip install -q tfds-nightly
-
-
-#!pip install matplotlib==3.2.2
-
-#!pip install -q tqdm
-
-#from google.colab import drive
-
-#drive.mount('/content/gdrive', force_remount=True)
-
-
-import tensorflow as tf
-"""
-from tensorflow.compat.v1 import ConfigProto
-from tensorflow.compat.v1 import InteractiveSession
-
-config = ConfigProto()
-config.gpu_options.allow_growth = True
-session = InteractiveSession(config=config)
-"""
-physical_devices = tf.config.experimental.list_physical_devices('GPU')
-if len(physical_devices) > 0:
-	for i in physical_devices:
-		tf.config.experimental.set_memory_growth(i, True)
 import time
 import numpy as np
-import matplotlib.pyplot as plt
-import tensorflow as tf
-
-# You'll generate plots of attention in order to see which parts of an image
-# our model focuses on during captioning
 import matplotlib.pyplot as plt
 
 # Scikit-learn includes many helpful utilities
@@ -87,7 +53,7 @@ my_parser = argparse.ArgumentParser()
 my_parser.version = '1.0'
 
 my_parser.add_argument('-BATCH_SIZE', action='store', type=int, required=True)
-my_parser.add_argument('-BUFFER_SIZE', action='store', type=int, default=10)
+my_parser.add_argument('-BUFFER_SIZE', action='store', type=int, default=8000)
 my_parser.add_argument('-train_size', action='store', type=int, default=128)
 my_parser.add_argument('-do_test_on_train', action='store', type=int, default=0)
 
@@ -97,11 +63,26 @@ my_parser.add_argument('-d_model', action='store', type=int, default=512)
 my_parser.add_argument('-dff', action='store', type=int, default=512)
 my_parser.add_argument('-num_heads', action='store', type=int, default=8)
 my_parser.add_argument('-EPOCHS', action='store', type=int, required=True)
-
+my_parser.add_argument('-use_cache', action='store', type=int, required=True)
+my_parser.add_argument('-use_gpu', action='store', type=int, required=True)
+my_parser.add_argument('-use_joint_embedding', action='store', type=int, required=True)
 my_parser.add_argument('-train_dir', action='store', type=str, required=True)
 my_parser.add_argument('-test_dir', action='store', type=str, required=True)
+my_parser.add_argument('-caption_dir', action='store', type=str, required=True)
 args = my_parser.parse_args()
 
+import os
+
+os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"]=str(args.use_gpu)
+
+
+import tensorflow as tf
+
+physical_devices = tf.config.experimental.list_physical_devices('GPU')
+if len(physical_devices) > 0:
+  for i in physical_devices:
+    tf.config.experimental.set_memory_growth(i, True)
 
 BATCH_SIZE = args.BATCH_SIZE
 BUFFER_SIZE = args.BUFFER_SIZE
@@ -116,24 +97,273 @@ dropout_rate = 0.1
 do_test_on_train = args.do_test_on_train
 
 
-import pickle
-import gzip
-def load_dataset_file(filename):
-  with gzip.open(filename, "rb") as f:
-    loaded_object = pickle.load(f)
-    return loaded_object
 
-p = load_dataset_file(args.train_dir)
+f2 = open(args.caption_dir, 'r+')
+train_captions = f2.readlines()
+f2.close()
+train_captions_en = [i.strip('\n') for i in train_captions]
 
-videos,captions,glosses = [],[],[]
-for i in range(len(p)):
-  videos.append(np.asarray(p[i]['sign']))
-  captions.append(p[i]['text'])
-  glosses.append(p[i]['gloss'])
+from sacremoses import MosesTokenizer, MosesDetokenizer
+mt = MosesTokenizer(lang='de')
+class MosesPreTokenizer:
+    def moses_split(self, i,normalized_string):
+        splits = []
+        start = 0
+        
+        # we need to call `str(normalized_string)` because jieba expects a str,
+        # not a NormalizedString
+        
+        k = mt.tokenize(str(normalized_string))
+        import re
+        text = str(normalized_string)
+        result = list(re.finditer(k[0],text))[0]
+        t1 = result.start()
+        t2 = result.end()
+        splits.append(normalized_string[t1:t2])
+        for i in k[1:]:
+          
+          for r in re.finditer(i,text):
+            temp1 = r.start()
+            temp2 = r.end()
+            if temp1>=t2:
+              splits.append(normalized_string[temp1:temp2])
+              t1 = temp1
+              t2 = temp2
+              break
+            else:
+              continue
+  
+
+        return splits
+        # We can also easily do it in one line:
+        # return [normalized_string[w[1] : w[2]] for w in jieba.tokenize(str(normalized_string))]
+
+    
+
+    def pre_tokenize(self, pretok):
+        # Let's call split on the PreTokenizedString to split using `self.jieba_split`
+        pretok.split(self.moses_split)
+        # Here we can call `pretok.split` multiple times if we want to apply
+        # different algorithm, but we generally just need to call it once.
+        
 
 
 
-def get_tokenizer(arr,for_what='',start_token="",end_token=""):
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+if not args.use_cache:
+  import pickle
+  import gzip
+  def load_dataset_file(filename):
+    with gzip.open(filename, "rb") as f:
+      loaded_object = pickle.load(f)
+      return loaded_object
+
+  p = load_dataset_file(args.train_dir)
+
+  videos,captions,glosses = [],[],[]
+  names = []
+  for i in range(len(p)):
+    videos.append(np.asarray(p[i]['sign']))
+    captions.append(p[i]['text'])
+    glosses.append(p[i]['gloss'])
+    names.append(p[i]['name'])
+
+  if args.use_joint_embedding:
+    glosses = [i.lower() for i in glosses]
+
+  captions = [i.lower() for i in captions]
+
+  def get_tokenizer(arr,for_what='',start_token="",end_token="",special = False,pretok = 'moses'):
+    from tokenizers import Tokenizer, Regex, NormalizedString, PreTokenizedString
+    from tokenizers.models import BPE
+    tokenizer = Tokenizer(BPE())
+    from tokenizers.trainers import BpeTrainer
+
+    trainer = BpeTrainer(special_tokens=["[PAD]","[UNK]", "[CLS]", "[SEP]", "[MASK]", start_token, end_token])
+    from tokenizers.pre_tokenizers import PreTokenizer,Whitespace
+    if pretok=='moses':
+      tokenizer.pre_tokenizer = PreTokenizer.custom(MosesPreTokenizer())
+    elif pretok=='whitespace':
+      tokenizer.pre_tokenizer = Whitespace()
+
+
+    train_captions = [i+'\n' for i in arr]
+
+    f1 = open('train_{}_dir.txt'.format(for_what), 'w')
+    f1.writelines(train_captions)
+    f1.close()
+    tokenizer.train(trainer, [os.path.join(os.getcwd(),'train_{}_dir.txt'.format(for_what))])
+    
+      
+    from tokenizers.processors import TemplateProcessing
+
+    tokenizer.post_processor = TemplateProcessing(
+        single="{} $A {}".format(start_token,end_token),
+        special_tokens=[
+            (start_token, tokenizer.token_to_id(start_token)),
+            (end_token, tokenizer.token_to_id(end_token)),
+        ],
+    )
+    tokenizer.enable_padding(pad_id=0, pad_token="[PAD]")
+
+    o = tokenizer.encode_batch(arr)
+    train_captions_final = np.asarray([i.ids for i in o],dtype = np.int32)
+    return train_captions_final,tokenizer
+  if args.use_joint_embedding:
+    _,tokenizer = get_tokenizer(captions+glosses,'joint',"[SOS]","[EOS]")
+    train_captions_en,tokenizer_en = get_tokenizer(train_captions_en,'translationen',"[EN-START]","[EN-END]") 
+    train_captions_final = np.asarray([i.ids for i in tokenizer.encode_batch(captions)],dtype = np.int32)
+    train_glosses_final = np.asarray([i.ids for i in tokenizer.encode_batch(glosses)],dtype = np.int32)
+    tokenizer_r = tokenizer
+    print('inside joint embedding')
+
+
+
+  else:
+    train_captions_final,tokenizer = get_tokenizer(captions,'translation',"[TRANS-START]","[TRANS-END]",pretok='moses') 
+    train_glosses_final,tokenizer_r = get_tokenizer(glosses,'recognition',"[RECOG-START]","[RECOG-END]",pretok='whitespace')
+    train_captions_en,tokenizer_en = get_tokenizer(train_captions_en,'translationen',"[EN-START]","[EN-END]",pretok='whitespace') 
+
+
+  l = max(np.shape(train_captions_final)[-1],np.shape(train_glosses_final)[-1],np.shape(train_captions_en)[-1])
+
+  train_captions_final = tf.keras.preprocessing.sequence.pad_sequences(
+      train_captions_final, maxlen=l, dtype='int32', padding='post'
+  )
+
+  train_glosses_final = tf.keras.preprocessing.sequence.pad_sequences(
+      train_glosses_final, maxlen=l, dtype='int32', padding='post'
+  )
+
+  train_captions_en = tf.keras.preprocessing.sequence.pad_sequences(
+      train_captions_en, maxlen=l, dtype='int32', padding='post'
+  )
+  print('train caption')
+  print(train_captions_en)
+  assert np.shape(train_captions_final)[-1]==np.shape(train_glosses_final)[-1]
+  assert np.shape(train_captions_en)[-1]==np.shape(train_glosses_final)[-1]
+  print('captions shape {}'.format(np.shape(train_captions_final)))
+  print('glosses shape {}'.format(np.shape(train_glosses_final)))
+
+  def create_padding_mask_image(videos):
+    
+    lens = []
+    for i in videos:
+      lens.append(i.shape[0])
+    m_len = max(lens)
+    print(m_len)
+    mask=[]
+    for i in videos:
+      l = i.shape[0]
+      temp1 = [0 for _ in range(l)]
+      temp2 = [1 for _ in range(m_len-l)]
+      mask.append(temp1+temp2)
+    mask = tf.cast(mask,tf.float32)
+    print('done')
+    #return mask[:, tf.newaxis, tf.newaxis, :]
+    videos = tf.keras.preprocessing.sequence.pad_sequences(videos, padding='post', dtype = 'float32')
+    return np.asarray(mask),videos
+  video_mask,videos = create_padding_mask_image(videos)
+
+  print(
+    'DONE UPTO THIS'
+  )
+  masks = []
+  for vid in videos:
+    mask = []
+    for i in vid:
+      #print(i)
+      if (np.asarray(i)==np.zeros(len(i))).all():
+        mask.append(1)
+      else:
+        mask.append(0)
+    masks.append(mask)
+
+
+  assert (video_mask==masks).all()
+
+  videos = [i for i in videos]
+
+  cn = 0
+  for i,j in zip(train_captions_final,captions):
+    print((tokenizer.decode(i),j))
+    if cn==5:
+      break
+    cn+=1
+  
+
+    #assert tokenizer.decode(i)==j
+  """
+  for i,j in zip(train_glosses_final,glosses):
+    print((tokenizer_r.decode(i),j))
+    assert tokenizer_r.decode(i)==j
+  """
+  def map_func(img_name, cap,gloss,mask,en):
+    #img_tensor = np.load(os.path.join(os.getcwd(),'processed_img',img_name.decode('utf-8').split('/')[-1]+'_constructed'+'.npy'))
+    #img_tensor = np.load(img_name.decode('utf-8')+'.npy')
+    return img_name, cap,gloss,mask,en
+    #return img_tensor, cap,gloss,mask,en
+
+
+  def tf_encode(img, cap,gloss,mask,en):
+    result_pt, result_en, result_en1,mask,en = tf.numpy_function(map_func, [img, cap,gloss,mask,en], [tf.float32, tf.int32, tf.int32,tf.float32,tf.int32])
+    result_en.set_shape([None])
+    result_en1.set_shape([None])
+    result_pt.set_shape([None,None])
+    mask.set_shape([None])
+    en.set_shape([None])
+    return result_pt, result_en, result_en1,mask,en
+
+  dataset = tf.data.Dataset.from_tensor_slices((videos, train_captions_final,train_glosses_final,video_mask,train_captions_en))
+
+  # Use map to load the numpy files in parallel
+  dataset = dataset.map(tf_encode)
+
+  # Shuffle and batch
+
+
+  dataset = dataset.shuffle(BUFFER_SIZE).padded_batch(BATCH_SIZE,([None,None],[None],[None],[None],[None]))
+
+
+
+
+  print('dataset created')
+
+elif args.use_cache:
+  import pickle
+  import gzip
+  def load_dataset_file(filename):
+    with gzip.open(filename, "rb") as f:
+      loaded_object = pickle.load(f)
+      return loaded_object
+
+  p = load_dataset_file(args.train_dir)
+
+  videos,captions,glosses = [],[],[]
+  for i in range(len(p)):
+    videos.append(np.asarray(p[i]['sign']))
+    captions.append(p[i]['text'])
+    glosses.append(p[i]['gloss'])
+
+
+
+  def get_tokenizer(arr,for_what='',start_token="",end_token="",special = False):
     from tokenizers import Tokenizer
     from tokenizers.models import BPE
 
@@ -149,6 +379,8 @@ def get_tokenizer(arr,for_what='',start_token="",end_token=""):
     f1.writelines(train_captions)
     f1.close()
     tokenizer.train(trainer, [os.path.join(os.getcwd(),'train_{}_dir.txt'.format(for_what))])
+    
+      
     from tokenizers.processors import TemplateProcessing
 
     tokenizer.post_processor = TemplateProcessing(
@@ -164,101 +396,59 @@ def get_tokenizer(arr,for_what='',start_token="",end_token=""):
     train_captions_final = np.asarray([i.ids for i in o],dtype = np.int32)
     return train_captions_final,tokenizer
 
-train_captions_final,tokenizer = get_tokenizer(captions,'translation',"[TRANS-START]","[TRANS-END]") 
-train_glosses_final,tokenizer_r = get_tokenizer(glosses,'recognition',"[RECOG-START]","[RECOG-END]") 
+
+  train_captions_final,tokenizer = get_tokenizer(captions,'translation',"[TRANS-START]","[TRANS-END]") 
+  train_glosses_final,tokenizer_r = get_tokenizer(glosses,'recognition',"[RECOG-START]","[RECOG-END]")
+  train_captions_en,tokenizer_en = get_tokenizer(train_captions_en,'translationen',"[EN-START]","[EN-END]") 
 
 
-l = np.shape(train_captions_final)[-1]
-train_glosses_final = tf.keras.preprocessing.sequence.pad_sequences(
-    train_glosses_final, maxlen=l, dtype='int32', padding='post'
-)
+  l = max(np.shape(train_captions_final)[-1],np.shape(train_glosses_final)[-1],np.shape(train_captions_en)[-1])
 
-assert np.shape(train_captions_final)[-1]==np.shape(train_glosses_final)[-1]
-print('captions shape {}'.format(np.shape(train_captions_final)))
-print('glosses shape {}'.format(np.shape(train_glosses_final)))
+  train_captions_final = tf.keras.preprocessing.sequence.pad_sequences(
+      train_captions_final, maxlen=l, dtype='int32', padding='post'
+  )
 
-def create_padding_mask_image(videos):
-  
-  lens = []
-  for i in videos:
-	  lens.append(i.shape[0])
-  m_len = max(lens)
-  print(m_len)
-  mask=[]
-  for i in videos:
-	  l = i.shape[0]
-	  temp1 = [0 for _ in range(l)]
-	  temp2 = [1 for _ in range(m_len-l)]
-	  mask.append(temp1+temp2)
-  mask = tf.cast(mask,tf.float32)
-  print('done')
-  #return mask[:, tf.newaxis, tf.newaxis, :]
-  videos = tf.keras.preprocessing.sequence.pad_sequences(videos, padding='post', dtype = 'float32')
-  return np.asarray(mask),videos
-video_mask,videos = create_padding_mask_image(videos)
+  train_glosses_final = tf.keras.preprocessing.sequence.pad_sequences(
+      train_glosses_final, maxlen=l, dtype='int32', padding='post'
+  )
 
-print(
-  'DONE UPTO THIS'
-)
-masks = []
-for vid in videos:
-  mask = []
-  for i in vid:
-    #print(i)
-    if (np.asarray(i)==np.zeros(len(i))).all():
-      mask.append(1)
-    else:
-      mask.append(0)
-  masks.append(mask)
+  train_captions_en = tf.keras.preprocessing.sequence.pad_sequences(
+      train_captions_en, maxlen=l, dtype='int32', padding='post'
+  )
+  print('train caption')
+  print(train_captions_en)
+  assert np.shape(train_captions_final)[-1]==np.shape(train_glosses_final)[-1]
+  assert np.shape(train_captions_en)[-1]==np.shape(train_glosses_final)[-1]
+  print('captions shape {}'.format(np.shape(train_captions_final)))
+  print('glosses shape {}'.format(np.shape(train_glosses_final)))
+  parts = []
+  def read_map_fn1(x):
+      
+      return tf.io.parse_tensor(x,tf.float32)
 
+  def read_map_fn2(x):
+      
+      return tf.io.parse_tensor(x,tf.int32)
 
-assert (video_mask==masks).all()
-
-videos = [i for i in videos]
-
-
-for i,j in zip(train_captions_final,captions):
-  assert tokenizer.decode(i)==j
-"""
-for i,j in zip(train_glosses_final,glosses):
-  print((tokenizer_r.decode(i),j))
-  assert tokenizer_r.decode(i)==j
-"""
-def map_func(img_name, cap,gloss,mask):
-  #img_tensor = np.load(os.path.join(os.getcwd(),'processed_img',img_name.decode('utf-8').split('/')[-1]+'_constructed'+'.npy'))
-  
-  return img_name, cap,gloss,mask
-
-
-def tf_encode(img, cap,gloss,mask):
-  result_pt, result_en, result_en1,mask = tf.numpy_function(map_func, [img, cap,gloss,mask], [tf.float32, tf.int32, tf.int32,tf.float32])
-  result_en.set_shape([None])
-  result_en1.set_shape([None])
-  result_pt.set_shape([None,None])
-  mask.set_shape([None])
-  return result_pt, result_en, result_en1,mask
-
-dataset = tf.data.Dataset.from_tensor_slices((videos, train_captions_final,train_glosses_final,video_mask))
-
-# Use map to load the numpy files in parallel
-dataset = dataset.map(tf_encode)
-
-# Shuffle and batch
-
-
-dataset = dataset.shuffle(BUFFER_SIZE).padded_batch(BATCH_SIZE,([None,None],[None],[None],[None]))
+  parts.append(tf.data.TFRecordDataset(f'mydata.0.tfrecord').map(read_map_fn1))
+  parts.append(tf.data.TFRecordDataset(f'mydata.1.tfrecord').map(read_map_fn2))
+  parts.append(tf.data.TFRecordDataset(f'mydata.2.tfrecord').map(read_map_fn2))
+  parts.append(tf.data.TFRecordDataset(f'mydata.3.tfrecord').map(read_map_fn1))
+  parts.append(tf.data.TFRecordDataset(f'mydata.4.tfrecord').map(read_map_fn2))
+  dataset = tf.data.Dataset.zip(tuple(parts))
+  dataset = dataset.shuffle(BUFFER_SIZE).padded_batch(BATCH_SIZE,([None,None],[None],[None],[None],[None]))  
+  print('dataset used from cache')
 
 
 
 
-print('dataset created')
 
 
 
 input_vocab_size = tokenizer.get_vocab_size()  # useless for image
 target_vocab_size_recog = tokenizer_r.get_vocab_size() 
 target_vocab_size_trans = tokenizer.get_vocab_size() 
-
+target_vocab_size_trans_en = tokenizer_en.get_vocab_size()
 def get_angles(pos, i, d_model):
   angle_rates = 1 / np.power(10000, (2 * (i//2)) / np.float32(d_model))
   return pos * angle_rates
@@ -481,8 +671,7 @@ class Encoder(tf.keras.layers.Layer):
     self.num_layers = num_layers
     
     #self.embedding = tf.keras.layers.Embedding(input_vocab_size, d_model)
-    #self.embedding = tf.keras.layers.Dense(d_model)
-    self.embedding = tf.keras.layers.Dense(d_model,activation='relu')
+    self.embedding = tf.keras.layers.Dense(d_model,activation = 'relu')
     self.normalization = tf.keras.layers.BatchNormalization()
     self.pos_encoding = positional_encoding(maximum_position_encoding, 
                                             self.d_model)
@@ -499,8 +688,8 @@ class Encoder(tf.keras.layers.Layer):
     
     # adding embedding and position encoding.
     x = self.embedding(x)  # (batch_size, input_seq_len, d_model)
-    x = self.normalization(x,training = training)
     
+    x = self.normalization(x,training = training)
     #print(np.shape(x))
     #x *= tf.math.sqrt(tf.cast(self.d_model, tf.float32))
     x += self.pos_encoding[:, :seq_len, :]
@@ -537,6 +726,8 @@ class Decoder(tf.keras.layers.Layer):
                        for _ in range(num_layers)]
 
     self.dec_layer_trans = DecoderLayer(d_model, num_heads, dff, rate)
+    self.dec_layer_trans1 = DecoderLayer(d_model, num_heads, dff, rate)
+    self.dec_layer_trans_en = DecoderLayer(d_model, num_heads, dff, rate)
     self.dec_layer_recog = DecoderLayer(d_model, num_heads, dff, rate)
     self.dropout = tf.keras.layers.Dropout(rate)
     
@@ -560,9 +751,11 @@ class Decoder(tf.keras.layers.Layer):
       attention_weights['decoder_layer{}_block2'.format(i+1)] = block2
 
     x_trans,_,_ = self.dec_layer_trans(x,enc_output,training,look_ahead_mask_trans,padding_mask_trans)
+    x_trans,_,_ = self.dec_layer_trans1(x_trans,enc_output,training,look_ahead_mask_trans,padding_mask_trans)
     x_recog,_,_ = self.dec_layer_recog(x,enc_output,training,look_ahead_mask_recog,padding_mask_recog)
+    x_trans_en,_,_ = self.dec_layer_trans_en(x,enc_output,training,look_ahead_mask_recog,padding_mask_recog)
     # x.shape == (batch_size, target_seq_len, d_model)
-    return x_recog,x_trans, attention_weights
+    return x_recog,x_trans,x_trans_en, attention_weights
 
 
 """## Create the Transformer
@@ -572,7 +765,7 @@ Transformer consists of the encoder, decoder and a final linear layer. The outpu
 
 class Transformer(tf.keras.Model):
   def __init__(self, num_layers_enc,num_layers_dec, d_model, num_heads, dff, input_vocab_size, 
-               target_vocab_size_recog,target_vocab_size_trans, pe_input, pe_target, rate=0.1):
+               target_vocab_size_recog,target_vocab_size_trans,target_vocab_size_trans_en, pe_input, pe_target, rate=0.1):
     super(Transformer, self).__init__()
 
     self.encoder = Encoder(num_layers_enc, d_model, num_heads, dff, 
@@ -583,6 +776,7 @@ class Transformer(tf.keras.Model):
 
     self.final_layer_recog = tf.keras.layers.Dense(target_vocab_size_recog)
     self.final_layer_trans = tf.keras.layers.Dense(target_vocab_size_trans)
+    self.final_layer_trans_en = tf.keras.layers.Dense(target_vocab_size_trans_en)
     
   def call(self, inp, tar, training, enc_padding_mask, 
            look_ahead_mask_recog, dec_padding_mask_recog, look_ahead_mask_trans, dec_padding_mask_trans):
@@ -590,12 +784,16 @@ class Transformer(tf.keras.Model):
     enc_output = self.encoder(inp, training, enc_padding_mask)  # (batch_size, inp_seq_len, d_model)
     
     # dec_output.shape == (batch_size, tar_seq_len, d_model)
-    dec_output_recog,dec_output_trans, attention_weights = self.decoder(
+    dec_output_recog,dec_output_trans,dec_output_trans_en, attention_weights = self.decoder(
         tar, enc_output, training, look_ahead_mask_recog, dec_padding_mask_recog, look_ahead_mask_trans, dec_padding_mask_trans)
     
     final_output_recog = self.final_layer_recog(dec_output_recog)  # (batch_size, tar_seq_len, target_vocab_size)
     final_output_trans = self.final_layer_trans(dec_output_trans)
-    return final_output_recog,final_output_trans, attention_weights
+    final_output_trans_en = self.final_layer_trans_en(dec_output_trans_en)
+    #print('RECOG {}'.format(tf.print(final_output_recog)))
+    #print('de {}'.format(tf.print(final_output_trans)))
+    #print('en {}'.format(tf.print(final_output_trans_en)))
+    return final_output_recog,final_output_trans,final_output_trans_en, attention_weights
 
 """## Set hyperparameters
 
@@ -643,9 +841,13 @@ Since the target sequences are padded, it is important to apply a padding mask w
 loss_object = tf.keras.losses.SparseCategoricalCrossentropy(
     from_logits=True, reduction='none')
 
-def loss_function(real, pred):
+def loss_function(real, pred,en = False):
   mask = tf.math.logical_not(tf.math.equal(real, 0))
   loss_ = loss_object(real, pred)
+  if en:
+  	pass
+    #tf.print(real)
+    #tf.print(pred)
 
   mask = tf.cast(mask, dtype=loss_.dtype)
   loss_ *= mask
@@ -661,7 +863,7 @@ train_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(
 
 
 transformer = Transformer(num_layers_enc,num_layers_dec, d_model, num_heads, dff,
-                          input_vocab_size, target_vocab_size_recog,target_vocab_size_trans, 
+                          input_vocab_size, target_vocab_size_recog,target_vocab_size_trans, target_vocab_size_trans_en,
                           pe_input=input_vocab_size, 
                           pe_target=target_vocab_size_trans,
                           rate=dropout_rate)
@@ -686,7 +888,7 @@ def create_masks(tar):
 
 """Create the checkpoint path and the checkpoint manager. This will be used to save checkpoints every `n` epochs."""
 
-checkpoint_path = "./checkpoints/train/peymanbatchnormrelu"
+checkpoint_path = "./checkpoints/train/final-exps/joint-everything-moses"
 
 ckpt = tf.train.Checkpoint(transformer=transformer,
                            optimizer=optimizer)
@@ -729,14 +931,16 @@ train_step_signature = [
     tf.TensorSpec(shape=(None,m_len,k), dtype=tf.float32),
     tf.TensorSpec(shape=(None,None), dtype=tf.int32),
     tf.TensorSpec(shape=(None,None), dtype=tf.int32),
-    tf.TensorSpec(shape=(None,None), dtype=tf.float32)
+    tf.TensorSpec(shape=(None,None), dtype=tf.float32),
+    tf.TensorSpec(shape=(None,None), dtype=tf.int32)
 ]
 @tf.function(input_signature=train_step_signature)
-def train_step(inp, tar1,tar2,mask):
+def train_step(inp, tar1,tar2,mask,tar3):
   #tar_inp1 = tar1[:, :-1]
   tar_real1 = tar1[:, 1:]
   tar_inp2 = tar2[:, :-1]
   tar_real2 = tar2[:, 1:]
+  tar_real_en = tar3[:, 1:]
   
   #print(mask)
   combined_mask_recog = create_masks(tar_inp2)
@@ -744,7 +948,7 @@ def train_step(inp, tar1,tar2,mask):
   enc_padding_mask = mask[:,tf.newaxis,tf.newaxis,:]
   dec_padding_mask_recog,dec_padding_mask_trans = mask[:,tf.newaxis,tf.newaxis,:],mask[:,tf.newaxis,tf.newaxis,:]
   with tf.GradientTape() as tape:
-    predictions1,predictions2, _ = transformer(inp, tar_inp2, 
+    predictions1,predictions2,predictions3, _ = transformer(inp, tar_inp2, 
                                  True, 
                                  enc_padding_mask, 
                                  combined_mask_recog, 
@@ -752,72 +956,31 @@ def train_step(inp, tar1,tar2,mask):
                                  combined_mask_trans,
                                  dec_padding_mask_trans)
     loss1 = loss_function(tar_real1, predictions1)
-    #tf.print([tar_real1,predictions1])
-    #tf.print([tar_real2,predictions2])
     loss2 = loss_function(tar_real2, predictions2)
-    loss = loss1+loss2
+    loss3 = loss_function(tar_real_en, predictions3,en=True)
+    loss = 0.8*loss1+loss2+0.7*loss3
 
   gradients = tape.gradient(loss, transformer.trainable_variables)    
   optimizer.apply_gradients(zip(gradients, transformer.trainable_variables))
   
-  train_loss(loss)
+  train_loss(loss2)
 
   train_accuracy(tar_real2, predictions2)
+  #train_accuracy(tar_real_en, predictions3)
 
 
 
 
 #video_mask_test = create_padding_mask_image(video_name_vector_test)
 
-def evaluate(video_test):
-  
-  final_feature = np.asarray(video_test,dtype= np.float32)
-  
-  encoder_input = tf.reshape(final_feature,(-1,1024))[tf.newaxis,:,:]
-  print('Encoder input in evaluation {}'.format(tf.shape(encoder_input)))
-  decoder_input = [tokenizer.token_to_id("[TRANS-START]")]
-  output = tf.expand_dims(decoder_input, 0)
-  
-  enc_padding_mask,dec_padding_mask = None,None
-  MAX_LENGTH = 28
-  for i in range(MAX_LENGTH):
-    combined_mask = create_masks(output)
-  
-    # predictions.shape == (batch_size, seq_len, vocab_size)
-    predictions1,predictions2, attention_weights = transformer(encoder_input, 
-                                                 output,
-                                                 False,
-                                                 enc_padding_mask,
-                                                 combined_mask,
-                                                 dec_padding_mask,
-                                                 combined_mask,
-                                                 dec_padding_mask)
-    
-    # select the last word from the seq_len dimension
-    predictions = predictions2[: ,-1:, :]  # (batch_size, 1, vocab_size)
 
-    predicted_id = tf.cast(tf.argmax(predictions, axis=-1), tf.int32)
-    
-    # return the result if the predicted_id is equal to the end token
-    if predicted_id == tokenizer.token_to_id("[TRANS-END]"):
-      return tf.squeeze(output, axis=0), attention_weights
-    
-    # concatentate the predicted_id to the output which is given to the decoder
-    # as its input.
-    output = tf.concat([output, predicted_id], axis=-1)
-
-  return tf.squeeze(output, axis=0), attention_weights
-
-
-
-"""
 def evaluate_beam(video_test,bl):
   final_feature = np.asarray(video_test,dtype= np.float32)
   
   encoder_input = tf.reshape(final_feature,(-1,1024))[tf.newaxis,:,:]
   #print('Encoder input in evaluation {}'.format(tf.shape(encoder_input)))
   
-  decoder_input = [tokenizer.token_to_id("[TRANS-START]")]
+  decoder_input = [tokenizer.token_to_id("[SOS]")]
   output = tf.expand_dims(decoder_input, 0)
   #output = [START]
   
@@ -827,7 +990,7 @@ def evaluate_beam(video_test,bl):
   combined_mask = create_masks(output)
 
   # predictions.shape == (batch_size, seq_len, vocab_size)
-  predictions1,predictions2, attention_weights = transformer(encoder_input, 
+  predictions1,predictions2,p3, attention_weights = transformer(encoder_input, 
                                                  output,
                                                  False,
                                                  enc_padding_mask,
@@ -850,7 +1013,7 @@ def evaluate_beam(video_test,bl):
     temp1,temp2 = [],[]
     for i,j in zip(outputs,predicted_prob):
       combined_mask = create_masks(i)
-      predictions1,predictions2, attention_weights = transformer(encoder_input, 
+      predictions1,predictions2,p3, attention_weights = transformer(encoder_input, 
                                                  i,
                                                  False,
                                                  enc_padding_mask,
@@ -891,22 +1054,70 @@ def evaluate_beam(video_test,bl):
   o = tf.squeeze(outputs[0,:,:])
   return o, None
 
-"""
+
+
+
+
+def evaluate(video_test):
+  
+  final_feature = np.asarray(video_test,dtype= np.float32)
+  
+  encoder_input = tf.reshape(final_feature,(-1,1024))[tf.newaxis,:,:]
+  #print('Encoder input in evaluation {}'.format(tf.shape(encoder_input)))
+  decoder_input = [tokenizer.token_to_id("[SOS]")]
+  output = tf.expand_dims(decoder_input, 0)
+  #output_en = tf.expand_dims([tokenizer_en.token_to_id("[EN-START]")], 0)
+  
+  enc_padding_mask,dec_padding_mask = None,None
+  MAX_LENGTH = 28
+  for i in range(MAX_LENGTH):
+    combined_mask = create_masks(output)
+  
+    # predictions.shape == (batch_size, seq_len, vocab_size)
+    predictions1,predictions2,predictions3, attention_weights = transformer(encoder_input, 
+                                                 output,
+                                                 False,
+                                                 enc_padding_mask,
+                                                 combined_mask,
+                                                 dec_padding_mask,
+                                                 combined_mask,
+                                                 dec_padding_mask)
+    
+    # select the last word from the seq_len dimension
+    predictions = predictions2[: ,-1:, :]  # (batch_size, 1, vocab_size)
+
+    predicted_id = tf.cast(tf.argmax(predictions, axis=-1), tf.int32)
+    
+    # return the result if the predicted_id is equal to the end token
+    if predicted_id == tokenizer.token_to_id("[EOS]"):
+      return tf.squeeze(output, axis=0), attention_weights
+    
+    # concatentate the predicted_id to the output which is given to the decoder
+    # as its input.
+    output = tf.concat([output, predicted_id], axis=-1)
+    #predictions_en = predictions3[: ,-1:, :]  # (batch_size, 1, vocab_size)
+
+    #predicted_id_en = tf.cast(tf.argmax(predictions_en, axis=-1), tf.int32)
+    #output_en = tf.concat([output_en, predicted_id_en], axis=-1)
+
+  return tf.squeeze(output, axis=0), attention_weights
+
 
 
 def translate(img,plot=''):
   result, attention_weights = evaluate(img)
-  #result_beam1,_ = evaluate_beam(img,2)
-  #result_beam2,_ = evaluate_beam(img,3)
+  result_beam1,_ = evaluate_beam(img,2)
+  result_beam2,_ = evaluate_beam(img,3)
   predicted_sentence1 = tokenizer.decode([i for i in result])
-  #predicted_sentence2 = tokenizer.decode([i for i in result_beam1])
-  #predicted_sentence3 = tokenizer.decode([i for i in result_beam2])
+  predicted_sentence2 = tokenizer.decode([i for i in result_beam1])
+  predicted_sentence3 = tokenizer.decode([i for i in result_beam2])
 
   print('Predicted translation: {}'.format(str(predicted_sentence1)))
-  #print('Predicted translation for bl 2: {}'.format(str(predicted_sentence2)))
-  #print('Predicted translation for bl 3: {}'.format(str(predicted_sentence3)))
-  #return predicted_sentence1,predicted_sentence2,predicted_sentence3
-  return predicted_sentence1
+  print('Predicted translation for bl 2: {}'.format(str(predicted_sentence2)))
+  print('Predicted translation for bl 3: {}'.format(str(predicted_sentence3)))
+  return predicted_sentence1,predicted_sentence2,predicted_sentence3
+  #return predicted_sentence1
+
   
  
 
@@ -919,8 +1130,8 @@ for i in range(len(p1)):
   videos_test.append(np.asarray(p1[i]['sign']))
   captions_test.append(p1[i]['text'])
   glosses_test.append(p1[i]['gloss'])
-
-
+#videos_test = videos_test[0:50]
+#captions_test = captions_test[0:50]
 if __name__== "__main__":
   for epoch in range(EPOCHS):
     start = time.time()
@@ -929,12 +1140,13 @@ if __name__== "__main__":
     train_accuracy.reset_states()
     
     # inp -> portuguese, tar -> english
-    for (batch, (inp, tar1,tar2,mask)) in tqdm(enumerate(dataset)):
+    for (batch, (inp, tar1,tar2,mask,tar3)) in tqdm(enumerate(dataset)):
       #print(tar)
       if epoch==0 and batch==0:
-      	print(tar1)
-      	print(tar2)
-      train_step(inp, tar2,tar1,mask)
+        print(tar2)
+        print(tar1)
+        print(tar3)
+      train_step(inp, tar2,tar1,mask,tar3)
       
       
       if batch % 50 == 0:
@@ -954,33 +1166,70 @@ if __name__== "__main__":
 
  
     
-  #ref,hyp1,hyp2,hyp3,temp = [],[],[],[],[]
-  ref,hyp1,temp = [],[],[]
-  for m,n in zip(videos_test,captions_test):
-    #translated1,translated2,translated3 = translate(m,False)
-    translated1 = translate(m,False)
+  ref,hyp1,hyp2,hyp3,temp = [],[],[],[],[]
+  #reference,hyp1,temp = [],[],[]
+  for m,n in tqdm(zip(videos_test[0:25],captions_test[0:25])):
+    translated1,translated2,translated3 = translate(m,False)
+    #translated1 = translate(m,False)
     
     hyp1.append(re.sub(r'^\s+|\s+$','',re.sub(r'\.', '', translated1)))
-    #hyp2.append(re.sub(r'^\s+|\s+$','',re.sub(r'\.', '', translated2)))
-    #hyp3.append(re.sub(r'^\s+|\s+$','',re.sub(r'\.', '', translated3)))
-    temp.append(re.sub(r'^\s+|\s+$','',re.sub(r'\.', '', n)))
-    print(n)
-    print('\n\n')
-  ref= [temp]
+    hyp2.append(re.sub(r'^\s+|\s+$','',re.sub(r'\.', '', translated2)))
+    hyp3.append(re.sub(r'^\s+|\s+$','',re.sub(r'\.', '', translated3)))
+    temp.append(re.sub(r'^\s+|\s+$','',re.sub(r'\.', '', n.lower())))
     
+  reference = [temp]
+  f1 = open('ref.txt', 'w')
+  f1.writelines([i+'\n' for i in temp])
+  f1.close()
+  f1 = open('trans.txt', 'w')
+  f1.writelines([i+'\n' for i in hyp1])
+  f1.close()
+  
+  """
+  import datasets
+  from sacremoses import MosesTokenizer, MosesDetokenizer
+  mt = MosesTokenizer(lang='de')
+  pred = []
+  for i in hyp1:
+    pred.append(mt.tokenize(i))
+  
+  ref = []
+  for i in reference:
+    k = []
+    for j in i:
+      k.append(mt.tokenize(j))
+    ref.append(k)
+ 
+  ref = []
+  for i in temp:
+    ref.append([mt.tokenize(i)])
+  metric = datasets.load_metric('bleu')
+  print('with smoothing')
+  metric.add_batch(predictions=pred, references=ref
+                   )
+  metric.compute(smooth=True,max_order=4)
+  print('without smoothing')
+  metric.add_batch(predictions=pred, references=ref
+                   )
+  metric.compute(max_order=4)
+  """
+
+
 
   #print(hyp)
   #print(ref)
-  score_bleu1 = sacrebleu.corpus_bleu(hyp1,ref)
-  #score_bleu2 = sacrebleu.corpus_bleu(hyp2,ref)
-  #score_bleu3 = sacrebleu.corpus_bleu(hyp3,ref)
+  score_bleu1 = sacrebleu.corpus_bleu(hyp1,reference)
+  score_bleu2 = sacrebleu.corpus_bleu(hyp2,reference)
+  score_bleu3 = sacrebleu.corpus_bleu(hyp3,reference)
   print('bleu greedy is {}'.format(score_bleu1.score))
-  #print('bleu bl=1 is {}'.format(score_bleu2.score))
-  #print('bleu bl=2 is {}'.format(score_bleu3.score))
+  print('bleu bl=2 is {}'.format(score_bleu2.score))
+  print('bleu bl=3 is {}'.format(score_bleu3.score))
     
 
  
   
+
+
 
 
 
