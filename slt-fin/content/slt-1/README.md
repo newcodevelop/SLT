@@ -22,9 +22,7 @@ This code is based on [SLT](https://github.com/neccam/slt) but modified to reali
 ## ToDo:
 
 - [X] *Initial code release.*
-- [X] *Release image features for Phoenix2014T.*
-- [ ] Share extensive qualitative and quantitative results & config files to generate them.
-- [ ] (Nice to have) - Guide to set up conda environment and docker image.
+- [ ] (Nice to have) - Proper guide to run the code .
 
 
 
