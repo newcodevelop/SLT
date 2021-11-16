@@ -2,7 +2,7 @@
 
 
 
-This code is based on [SLT](https://github.com/neccam/slt) but modified to realize our objective. 
+This code is based on [SLT](https://github.com/neccam/slt) but modified to realize our objective. Please note that this code is highly messy and we aim to make it cleaned up and maintainable once our paper is accepted. [Some Features May Not Work.]
  
 ## Requirements
 * Download the feature files using the `data/download.sh` script.
@@ -18,7 +18,7 @@ This code is based on [SLT](https://github.com/neccam/slt) but modified to reali
   `python -m signjoey train configs/sign.yaml` 
 
 ! Note that the default data directory is `./data`. If you download them to somewhere else, you need to update the `data_path` parameters in your config file.   
-
-
+! In the model file the logic for our proposed model is present. To change loss weight, we have to manually change them in the file itself.
+! The decoders file contain code for our proposed model's decoding section.
 
 
